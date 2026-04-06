@@ -1,0 +1,25 @@
+{
+  "name": "playing-with-langgraph",
+  "version": "1.0.0",
+  "description": "",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node --experimental-strip-types calculatorAgent/index.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.7.0",
+  "dependencies": {
+    "@langchain/langgraph": "^1.2.7",
+    "@langchain/openai": "^1.4.2",
+    "tsx": "4.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.2"
+  }
+}
