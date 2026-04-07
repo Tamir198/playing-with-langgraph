@@ -10,8 +10,17 @@ import { BaseMessage, HumanMessage } from '@langchain/core/messages';
 const calculator = tool(
   async ({ query }) => {
     try {
-      // ⚠️ Use a safer evaluation method in production!
-      return eval(query).toString();
+      let expression = query;
+      // If the model weirdly sent a JSON string, let's extract the math!
+      if (typeof query === 'string' && query.startsWith('{')) {
+        try {
+          const parsed = JSON.parse(query);
+          expression = parsed.description || parsed.query || query;
+        } catch {}
+      }
+
+      console.log(`--- Evaluating: "${expression}" ---`);
+      return eval(expression).toString();
     } catch {
       return 'Error: Invalid mathematical expression.';
     }
