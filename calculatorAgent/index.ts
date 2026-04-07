@@ -4,6 +4,8 @@ import { ChatOllama } from '@langchain/ollama';
 import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { BaseMessage, HumanMessage } from '@langchain/core/messages';
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 // 🛠️ TOOL DEFINITION
 // An agent's power comes from its tools. This tool lets the LLM perform math.
@@ -67,7 +69,8 @@ const shouldContinue = (state: typeof State.State) => {
   const { messages } = state;
   const lastMessage = messages[messages.length - 1];
 
-  const toolCalls = lastMessage.additional_kwargs.tool_calls || (lastMessage as any).tool_calls;
+  const toolCalls =
+    lastMessage.additional_kwargs.tool_calls || (lastMessage as any).tool_calls;
   if (toolCalls?.length > 0) {
     return 'tools';
   }
@@ -87,8 +90,16 @@ const app = graph.compile();
 
 // 🚀 EXECUTION
 const finalState = await app.invoke({
-  messages: [new HumanMessage('What is 2 + 2 * (10 / 2)?')],
+  messages: [new HumanMessage('What is 2 + 2 * (10 / 2 + 9)?')],
 });
 
+const finalResponse =
+  finalState.messages[finalState.messages.length - 1].content.toString();
+
 console.log('--- FINAL RESPONSE ---');
-console.log(finalState.messages[finalState.messages.length - 1].content);
+console.log(finalResponse);
+
+// 💾 SAVE TO FILE
+const outputPath = join('calculatorAgent', 'output.txt');
+await writeFile(outputPath, finalResponse, 'utf-8');
+console.log(`\n✅ Response saved to: ${outputPath}`);
