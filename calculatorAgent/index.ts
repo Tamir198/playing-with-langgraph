@@ -1,10 +1,5 @@
 import { Annotation, StateGraph, START, END } from '@langchain/langgraph';
 
-type GraphState = {
-  input: string;
-  result?: string;
-};
-
 // Define runtime state schema
 const stateDefinition = Annotation.Root({
   input: Annotation<string>(),
@@ -49,7 +44,7 @@ const graph = new StateGraph(stateDefinition)
 const app = graph.compile();
 
 const result = await app.invoke({
-  input: '2 + 2 * 5 ',
+  input: '2 + 2 * 55 -5 +5 -5+ 5 ',
 });
 
 console.log(result);
