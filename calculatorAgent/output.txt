@@ -1,5 +1,12 @@
-The calculation is: 2 + 2 * (10 / 2 + 9)
-= 2 + 2 * (5 + 9)
-= 2 + 2 * 14
-= 2 + 28
-= 30
+You: what is the initial result 
+Agent: It seems like I didn't receive any query from you to calculate an initial result.
+
+Could you please provide a valid mathematical expression, such as 2+2 or 5*3? I'll be happy to help you with the calculation and format the answer accordingly.
+You: 5 =5 -3 4
+Agent: The result of the expression `5 - 3 - 4` is `-2`.
+You: add 8
+Agent: The result of adding 8 to -2 is 6.
+You: divie by 4
+Agent: The result of dividing 8 by 4 is 2.
+You: squere root 
+Agent: {"name": "square root", "parameters": {"x": "0"}}

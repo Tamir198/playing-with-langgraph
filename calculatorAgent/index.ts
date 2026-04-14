@@ -1,9 +1,11 @@
 import { Annotation, StateGraph, START, END } from '@langchain/langgraph';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
+import { MemorySaver } from '@langchain/langgraph-checkpoint';
 import { ChatOllama } from '@langchain/ollama';
 import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { BaseMessage, HumanMessage } from '@langchain/core/messages';
+import { createInterface } from 'node:readline/promises';
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -86,20 +88,41 @@ const graph = new StateGraph(State)
   .addConditionalEdges('agent', shouldContinue)
   .addEdge('tools', 'agent'); // Tools always go back to agent for summary
 
-const app = graph.compile();
+// 🧠 CHECKPOINTER — saves the graph state after every node so the agent
+// can "remember" previous turns within the same thread_id session.
+const checkpointer = new MemorySaver();
+const app = graph.compile({ checkpointer });
 
-// 🚀 EXECUTION
-const finalState = await app.invoke({
-  messages: [new HumanMessage('What is 2 + 2 * (10 / 2 + 9)?')],
-});
+// 🚀 INTERACTIVE CONVERSATION LOOP
+// Each invoke() with the same thread_id reloads the full message history from
+// the checkpointer, so the agent sees every previous turn automatically.
+const config = { configurable: { thread_id: 'session-1' } };
 
-const finalResponse =
-  finalState.messages[finalState.messages.length - 1].content.toString();
+const rl = createInterface({ input: process.stdin, output: process.stdout });
 
-console.log('--- FINAL RESPONSE ---');
-console.log(finalResponse);
+console.log('🧮 Calculator Agent (type "exit" to quit)\n');
 
-// 💾 SAVE TO FILE
+const conversationLog: string[] = [];
+
+while (true) {
+  const userInput = await rl.question('You: ');
+  if (userInput.trim().toLowerCase() === 'exit') break;
+
+  const result = await app.invoke(
+    { messages: [new HumanMessage(userInput)] },
+    config,
+  );
+
+  const lastMessage = result.messages[result.messages.length - 1];
+  const response = lastMessage.content.toString();
+
+  console.log(`Agent: ${response}\n`);
+  conversationLog.push(`You: ${userInput}`, `Agent: ${response}`);
+}
+
+rl.close();
+
 const outputPath = join('calculatorAgent', 'output.txt');
-await writeFile(outputPath, finalResponse, 'utf-8');
-console.log(`\n✅ Response saved to: ${outputPath}`);
+await writeFile(outputPath, conversationLog.join('\n'), 'utf-8');
+console.log(`💾 Conversation saved to: ${outputPath}`);
+console.log('👋 Goodbye!');
