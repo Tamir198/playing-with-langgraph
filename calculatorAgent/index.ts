@@ -9,8 +9,10 @@ const config = { configurable: { thread_id: 'session-1' } };
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 
-console.log('🧮 Calculator Agent with Human-in-the-Loop (type "exit" to quit)\n');
+console.log('🧮 Calculator Agent with Human-in-the-Loop (type "exit" to quit)');
+console.log('   Tool approval options: yes / no / always\n');
 
+let autoApprove = false;
 const conversationLog: string[] = [];
 
 while (true) {
@@ -30,10 +32,23 @@ while (true) {
     console.log(`\n⏸️  Agent wants to call a tool:`);
     console.log(`   Tool calls: ${JSON.stringify(interruptValue.tool_calls, null, 2)}`);
 
-    const approval = await rl.question('\n✅ Approve? (yes/no): ');
-    const decision = approval.trim().toLowerCase().startsWith('y')
-      ? 'approve'
-      : 'reject';
+    let decision: string;
+
+    if (autoApprove) {
+      console.log('\n🟢 Auto-approved (always mode)');
+      decision = 'approve';
+    } else {
+      const approval = await rl.question('\n✅ Approve? (yes/no/always): ');
+      const answer = approval.trim().toLowerCase();
+
+      if (answer === 'always') {
+        autoApprove = true;
+        console.log('🟢 Auto-approve enabled for all future tool calls');
+        decision = 'approve';
+      } else {
+        decision = answer.startsWith('y') ? 'approve' : 'reject';
+      }
+    }
 
     result = await app.invoke(new Command({ resume: decision }), config);
     state = await app.getState(config);
