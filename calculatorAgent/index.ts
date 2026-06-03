@@ -1,5 +1,5 @@
 import { HumanMessage, type BaseMessage } from '@langchain/core/messages';
-import { Command } from '@langchain/langgraph';
+import { Command, type StateSnapshot } from '@langchain/langgraph';
 import { createInterface } from 'node:readline/promises';
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -23,70 +23,70 @@ type GraphInput = Parameters<typeof app.stream>[0];
  * changes.
  *
  *   'values'   → after each step, yields the FULL current state.
- *                Easy to inspect, but verbose. Good for debugging state shape.
- *
  *   'updates'  → after each step, yields only the DIFF: { [nodeName]: update }.
- *                Best for "which node just ran and what did it write?".
- *                Interrupts arrive as { __interrupt__: [...] }.
- *
  *   'messages' → yields LLM output token-by-token: [AIMessageChunk, metadata].
- *                Use this for typewriter UIs. `metadata.langgraph_node` tells
- *                you which node produced the chunk.
- *
  *   'debug'    → verbose lifecycle events (task start/end, checkpoints).
- *
  *   ['updates', 'messages'] → mixed mode. Each yield is a [mode, chunk] tuple
- *                so you can react to structural events AND tokens in one loop.
- *
- * We use the mixed mode so you can SEE node transitions interleaved with the
- * model's tokens as they stream in.
+ *                             so you can react to structural events AND tokens
+ *                             in one loop.
  */
 
-const config = { configurable: { thread_id: 'session-1' } };
+const THREAD_ID = 'session-1';
+
+/**
+ * The graph's runtime config. We track an optional `currentCheckpointId`
+ * so the user can rewind in time: when set, `app.stream(...)` resumes from
+ * that past checkpoint instead of the head, and any new input creates a
+ * BRANCH from that point (a new checkpoint whose parent is the past one).
+ *
+ * After a successful branched run we clear the override so subsequent
+ * messages extend the new branch normally.
+ */
+let currentCheckpointId: string | undefined = undefined;
+const buildConfig = () => ({
+  configurable: {
+    thread_id: THREAD_ID,
+    ...(currentCheckpointId ? { checkpoint_id: currentCheckpointId } : {}),
+  },
+});
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 
-console.log('🧮 Calculator Agent — streaming edition');
-console.log('   Tool approval options: yes / no / always\n');
+console.log('🧮 Calculator Agent — persistent + time-travel edition');
+console.log('   Tool approval options: yes / no / always');
+console.log('   Type /help for commands. State persists in calculator.sqlite.\n');
 
 let autoApprove = false;
 const conversationLog: string[] = [];
 
 const dim = (s: string) => `\x1b[90m${s}\x1b[0m`;
+const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
+const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
 
 /**
  * Run the graph as a stream and pretty-print:
  *   - dim "· node X finished" lines from the 'updates' channel
  *   - the agent's reply token-by-token from the 'messages' channel
  *
- * The function returns when the stream ends, which happens either because the
- * graph reached END or because it hit an interrupt() and is now paused.
- * The caller checks `app.getState(config)` to tell the difference.
- */
-/**
- * Returns `true` if any agent text was actually printed during the run.
- * The CLI uses this to decide whether it needs a fallback "print the final
- * assistant message" step (e.g. for models/providers whose `.stream()` only
- * emits tool-call chunks and no text, or in test scenarios).
+ * The function returns when the stream ends — either because the graph
+ * reached END or because it hit an interrupt() and is now paused. The
+ * caller checks `app.getState(...)` to tell the difference.
+ *
+ * Returns `true` if any agent text was actually printed during the run, so
+ * the caller can fall back to printing the final state's last message when
+ * the LLM only emitted tool-call chunks (no streamable text).
  */
 async function streamRun(input: GraphInput): Promise<boolean> {
   let typing = false;
   let printedAnyText = false;
 
-  /**
-   * When `streamMode` is an array, the SDK returns a **discriminated union**:
-   *   ['updates', updatesChunk] | ['messages', [BaseMessage, metadata]]
-   * Narrowing on `event[0]` lets TS infer the right shape for `event[1]` —
-   * no manual cast required.
-   */
   const stream = await app.stream(input, {
-    ...config,
+    ...buildConfig(),
     streamMode: ['updates', 'messages'],
   });
 
   for await (const event of stream) {
     if (event[0] === 'updates') {
-      // event[1] is { [nodeName]: nodeUpdate } | { __interrupt__: Interrupt[] }
       for (const nodeName of Object.keys(event[1])) {
         if (nodeName === '__interrupt__') continue;
         if (typing) {
@@ -96,16 +96,11 @@ async function streamRun(input: GraphInput): Promise<boolean> {
         console.log(dim(`  · node "${nodeName}" finished`));
       }
     } else if (event[0] === 'messages') {
-      // event[1] is [BaseMessage, Record<string, any>] (the SDK's metadata bag).
       const [msgChunk, meta] = event[1];
-
-      // Only print tokens from the agent node — skip ToolMessage chunks etc.
       if (meta.langgraph_node !== 'agent') continue;
-
       const text =
         typeof msgChunk.content === 'string' ? msgChunk.content : '';
       if (!text) continue;
-
       if (!typing) {
         process.stdout.write('Agent: ');
         typing = true;
@@ -119,22 +114,143 @@ async function streamRun(input: GraphInput): Promise<boolean> {
   return printedAnyText;
 }
 
+/**
+ * One-line summary of a checkpoint for `/history`. We pull the last message
+ * from the snapshot and label it by sender so the user can spot the right
+ * point to rewind to.
+ */
+function summarizeCheckpoint(snap: StateSnapshot): string {
+  const messages = (snap.values.messages ?? []) as BaseMessage[];
+  const last = messages[messages.length - 1];
+  if (!last) return '(empty state)';
+  const type = last.getType();
+  const raw =
+    typeof last.content === 'string'
+      ? last.content
+      : JSON.stringify(last.content);
+  const preview = raw.replace(/\s+/g, ' ').slice(0, 70);
+  const label =
+    type === 'human' ? 'user' : type === 'ai' ? 'agent' : type === 'tool' ? 'tool' : type;
+  return `[${label}] ${preview || '(no content)'}`;
+}
+
+/**
+ * `/history` — list the most recent checkpoints in this thread, newest first.
+ * `getStateHistory` returns an async iterator of `StateSnapshot`s; each one
+ * is a complete state at that point in time, with a `checkpoint_id` we can
+ * later use to rewind to it.
+ */
+async function showHistory(limit = 20): Promise<StateSnapshot[]> {
+  const snapshots: StateSnapshot[] = [];
+  for await (const snap of app.getStateHistory({
+    configurable: { thread_id: THREAD_ID },
+  })) {
+    snapshots.push(snap);
+    if (snapshots.length >= limit) break;
+  }
+
+  if (snapshots.length === 0) {
+    console.log(yellow('  (no history yet — send a message first)\n'));
+    return snapshots;
+  }
+
+  console.log(cyan(`\n  Checkpoint history (newest first, thread "${THREAD_ID}"):`));
+  for (const [i, snap] of snapshots.entries()) {
+    const id = snap.config.configurable?.checkpoint_id as string | undefined;
+    const shortId = id ? id.slice(0, 8) : '????????';
+    const cursor = id === currentCheckpointId ? cyan('▶ ') : '  ';
+    console.log(`  ${cursor}${String(i).padStart(2, ' ')}  ${shortId}  ${summarizeCheckpoint(snap)}`);
+  }
+  console.log();
+  return snapshots;
+}
+
+const helpText = `
+${cyan('Commands:')}
+  ${cyan('/help')}            show this help
+  ${cyan('/history')}         list checkpoints in this thread (newest first)
+  ${cyan('/goto <n>')}        rewind to checkpoint #n; next message branches the timeline
+  ${cyan('/head')}            return to the latest checkpoint (cancel a /goto)
+  ${cyan('exit')}             quit
+
+${dim('Anything else is treated as a message to the agent.')}
+`;
+
+/**
+ * Returns true if the input was handled as a slash-command (and the main
+ * loop should skip the agent-call step for this turn).
+ */
+async function handleCommand(raw: string): Promise<boolean> {
+  const input = raw.trim();
+  if (!input.startsWith('/')) return false;
+
+  const [cmd, ...args] = input.slice(1).split(/\s+/);
+
+  switch (cmd) {
+    case 'help':
+      console.log(helpText);
+      return true;
+
+    case 'history':
+      await showHistory();
+      return true;
+
+    case 'head':
+      currentCheckpointId = undefined;
+      console.log(cyan('  ▶ now pointing at the latest checkpoint\n'));
+      return true;
+
+    case 'goto': {
+      const n = Number(args[0]);
+      if (!Number.isInteger(n) || n < 0) {
+        console.log(yellow('  usage: /goto <n>   (n is the index from /history)\n'));
+        return true;
+      }
+      const snapshots = await showHistory();
+      const target = snapshots[n];
+      if (!target) {
+        console.log(yellow(`  no checkpoint at index ${n}\n`));
+        return true;
+      }
+      const id = target.config.configurable?.checkpoint_id as string | undefined;
+      if (!id) {
+        console.log(yellow('  that snapshot has no checkpoint_id\n'));
+        return true;
+      }
+      currentCheckpointId = id;
+      console.log(
+        cyan(`  ▶ rewound to checkpoint #${n} (${id.slice(0, 8)}). `) +
+          dim('Next message will branch from here.\n'),
+      );
+      return true;
+    }
+
+    default:
+      console.log(yellow(`  unknown command "/${cmd}". Try /help.\n`));
+      return true;
+  }
+}
+
 while (true) {
   const userInput = await rl.question('You: ');
   if (userInput.trim().toLowerCase() === 'exit') break;
+  if (!userInput.trim()) continue;
+
+  if (await handleCommand(userInput)) continue;
 
   let printedThisTurn = await streamRun({
     messages: [new HumanMessage(userInput)],
   });
 
+  // After a branched run, drop the rewind so future turns extend the new branch.
+  // We capture and clear here, before reading state, because subsequent
+  // `app.getState(...)` calls should see the head of the (now branched) thread.
+  const wasBranching = currentCheckpointId !== undefined;
+  currentCheckpointId = undefined;
+
   // The stream ends whenever the graph pauses; loop while interrupts are open.
-  // `getState` returns `StateSnapshot`, so `task` is auto-typed as
-  // `PregelTaskDescription` — no `as any` needed on the task.
-  let state = await app.getState(config);
+  let state = await app.getState(buildConfig());
   while (state.tasks.some((task) => task.interrupts.length > 0)) {
-    // `interrupt.value` is typed `any` in the SDK because the payload is
-    // user-defined. We own that contract via `ToolApprovalInterrupt`, so we
-    // assert it once at this boundary and the rest of the code stays typed.
     const interruptValue = state.tasks[0].interrupts[0]
       .value as ToolApprovalInterrupt;
     console.log(`\n⏸️  Agent wants to call a tool:`);
@@ -162,13 +278,10 @@ while (true) {
 
     const printedThisRun = await streamRun(new Command({ resume: decision }));
     printedThisTurn = printedThisTurn || printedThisRun;
-    state = await app.getState(config);
+    state = await app.getState(buildConfig());
   }
 
-  // `finalState.values` is `Record<string, any>` in the SDK because channels
-  // are user-defined. We know our `messages` channel holds `BaseMessage[]`
-  // (see state.ts), so we narrow it once here.
-  const finalState = await app.getState(config);
+  const finalState = await app.getState(buildConfig());
   const messages = finalState.values.messages as BaseMessage[];
   const lastMessage = messages[messages.length - 1];
   const response =
@@ -176,11 +289,12 @@ while (true) {
       ? lastMessage.content
       : JSON.stringify(lastMessage?.content ?? '');
 
-  // Fallback for providers/turns where the messages-mode stream produced no
-  // text (e.g. the LLM only emitted tool-call chunks, or the integration's
-  // streaming path is silent). We always want the user to see the answer.
   if (!printedThisTurn && response) {
     console.log(`Agent: ${response}`);
+  }
+
+  if (wasBranching) {
+    console.log(dim('  (branched timeline — older checkpoints are still in /history)'));
   }
 
   conversationLog.push(`You: ${userInput}`, `Agent: ${response}`);
