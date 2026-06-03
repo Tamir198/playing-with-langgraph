@@ -1,3 +1,9 @@
+# LangGraph SQLite checkpointer
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
 # Logs
 logs
 *.log
