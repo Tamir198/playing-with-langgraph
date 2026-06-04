@@ -56,7 +56,10 @@ console.log('🧮 Calculator Agent — persistent + time-travel edition');
 console.log('   Tool approval options: yes / no / always');
 console.log('   Type /help for commands. State persists in calculator.sqlite.\n');
 
-let autoApprove = false;
+// `autoApprove` used to live here as a local variable. It is now a state
+// channel (see state.ts), written via `Command.update` from `humanReview`,
+// and read directly off the persisted state — so it survives restarts.
+
 const conversationLog: string[] = [];
 
 const dim = (s: string) => `\x1b[90m${s}\x1b[0m`;
@@ -168,6 +171,7 @@ async function showHistory(limit = 20): Promise<StateSnapshot[]> {
 const helpText = `
 ${cyan('Commands:')}
   ${cyan('/help')}            show this help
+  ${cyan('/state')}            show all state channels (turnCount, autoApprove, toolNamesUsed, last message)
   ${cyan('/history')}         list checkpoints in this thread (newest first)
   ${cyan('/goto <n>')}        rewind to checkpoint #n; next message branches the timeline
   ${cyan('/head')}            return to the latest checkpoint (cancel a /goto)
@@ -175,6 +179,44 @@ ${cyan('Commands:')}
 
 ${dim('Anything else is treated as a message to the agent.')}
 `;
+
+/**
+ * `/state` — print every channel's current value. This is the cleanest way
+ * to *see* that channels are real, independent slots in state, each driven
+ * by its own reducer:
+ *
+ *   - turnCount     accumulates via the sum reducer
+ *   - autoApprove   single value, last-write-wins
+ *   - toolNamesUsed appends each time a tool runs
+ *   - messages      appends conversation history
+ */
+async function showState(): Promise<void> {
+  const snap = await app.getState(buildConfig());
+  const v = snap.values;
+  const messages = (v.messages ?? []) as BaseMessage[];
+  const last = messages[messages.length - 1];
+  const lastPreview = last
+    ? `[${last.getType()}] ${(typeof last.content === 'string'
+        ? last.content
+        : JSON.stringify(last.content)
+      )
+        .replace(/\s+/g, ' ')
+        .slice(0, 70)}`
+    : '(no messages yet)';
+
+  console.log(cyan('\n  Current state values:'));
+  console.log(`    turnCount      ${v.turnCount ?? 0}`);
+  console.log(`    autoApprove    ${v.autoApprove ?? false}`);
+  console.log(
+    `    toolNamesUsed  ${
+      Array.isArray(v.toolNamesUsed) && v.toolNamesUsed.length
+        ? '[' + v.toolNamesUsed.join(', ') + ']'
+        : '[]'
+    }`,
+  );
+  console.log(`    messages       ${messages.length} item(s); last → ${lastPreview}`);
+  console.log();
+}
 
 /**
  * Returns true if the input was handled as a slash-command (and the main
@@ -189,6 +231,10 @@ async function handleCommand(raw: string): Promise<boolean> {
   switch (cmd) {
     case 'help':
       console.log(helpText);
+      return true;
+
+    case 'state':
+      await showState();
       return true;
 
     case 'history':
@@ -249,6 +295,10 @@ while (true) {
   currentCheckpointId = undefined;
 
   // The stream ends whenever the graph pauses; loop while interrupts are open.
+  // Note: when `state.autoApprove === true`, `humanReview` short-circuits the
+  // interrupt entirely (see nodes.ts), so this loop just won't fire on
+  // approved threads. We still keep the loop for the very first interrupt
+  // and for threads where autoApprove was never set.
   let state = await app.getState(buildConfig());
   while (state.tasks.some((task) => task.interrupts.length > 0)) {
     const interruptValue = state.tasks[0].interrupts[0]
@@ -258,22 +308,19 @@ while (true) {
       `   Tool calls: ${JSON.stringify(interruptValue.tool_calls, null, 2)}`,
     );
 
-    let decision: ToolApprovalDecision;
+    const approval = await rl.question('\n✅ Approve? (yes/no/always): ');
+    const answer = approval.trim().toLowerCase();
 
-    if (autoApprove) {
-      console.log('\n🟢 Auto-approved (always mode)');
+    let decision: ToolApprovalDecision;
+    if (answer === 'always') {
+      decision = 'always';
+      console.log(
+        cyan('🟢 Auto-approve enabled — persisted to state.autoApprove'),
+      );
+    } else if (answer.startsWith('y')) {
       decision = 'approve';
     } else {
-      const approval = await rl.question('\n✅ Approve? (yes/no/always): ');
-      const answer = approval.trim().toLowerCase();
-
-      if (answer === 'always') {
-        autoApprove = true;
-        console.log('🟢 Auto-approve enabled for all future tool calls');
-        decision = 'approve';
-      } else {
-        decision = answer.startsWith('y') ? 'approve' : 'reject';
-      }
+      decision = 'reject';
     }
 
     const printedThisRun = await streamRun(new Command({ resume: decision }));

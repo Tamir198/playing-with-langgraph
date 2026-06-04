@@ -13,8 +13,14 @@ export interface ToolApprovalInterrupt {
   tool_calls: NonNullable<AIMessage['tool_calls']>;
 }
 
-/** What `interrupt()` resumes with — the value the CLI passes to `Command({ resume })`. */
-export type ToolApprovalDecision = 'approve' | 'reject';
+/**
+ * What the CLI passes back via `Command({ resume })`:
+ *   - 'approve' → run the tool once
+ *   - 'reject'  → don't run; route back to the agent so it can try again
+ *   - 'always'  → run the tool AND set state.autoApprove = true so the
+ *                 graph stops asking on future tool calls (persisted)
+ */
+export type ToolApprovalDecision = 'approve' | 'reject' | 'always';
 
 /**
  * Pull tool calls off the latest message, handling both shapes that may
@@ -44,9 +50,10 @@ const getToolCalls = (
  * request and emits zero `on_chat_model_stream` callbacks, which would make
  * the typewriter UI silent.
  *
- * `AIMessageChunk.concat` merges content AND tool_call_chunks correctly, so
- * the final accumulated message exposes a normal `.tool_calls` array — the
- * rest of the graph keeps working unchanged.
+ * This node also writes to the `turnCount` channel: returning `1` means
+ * "add one to the running total" because the channel's reducer is `a + b`.
+ * Note we only return `turnCount: 1` once per call regardless of how many
+ * chunks streamed — the reducer cares about node returns, not LLM chunks.
  */
 export const callModel = async (state: typeof State.State) => {
   const stream = await model.stream(state.messages);
@@ -56,7 +63,10 @@ export const callModel = async (state: typeof State.State) => {
     accumulated = accumulated ? accumulated.concat(chunk) : chunk;
   }
 
-  return { messages: accumulated ? [accumulated] : [] };
+  return {
+    messages: accumulated ? [accumulated] : [],
+    turnCount: 1,
+  };
 };
 
 export const shouldContinue = (state: typeof State.State) => {
@@ -64,7 +74,26 @@ export const shouldContinue = (state: typeof State.State) => {
   return getToolCalls(lastMessage).length > 0 ? 'review' : END;
 };
 
+/**
+ * Human-in-the-loop tool approval node. Demonstrates two important
+ * patterns:
+ *
+ *   1. READING state to short-circuit: if `state.autoApprove` is true, we
+ *      skip the interrupt entirely and route straight to the tools node.
+ *      The user's earlier "always" decision survives process restart
+ *      because it's persisted via the checkpointer.
+ *
+ *   2. WRITING state in transition via `Command.update`: when the user
+ *      replies 'always', we both route to 'tools' AND write
+ *      `autoApprove: true`. Because the channel's reducer is overwrite,
+ *      this becomes the new value. The next interrupt() check above will
+ *      see it and skip asking.
+ */
 export const humanReview = (state: typeof State.State): Command => {
+  if (state.autoApprove) {
+    return new Command({ goto: 'tools' });
+  }
+
   const lastMessage = state.messages[state.messages.length - 1];
   const toolCalls = getToolCalls(lastMessage);
 
@@ -75,7 +104,16 @@ export const humanReview = (state: typeof State.State): Command => {
 
   const decision = interrupt(payload) as ToolApprovalDecision;
 
-  return decision === 'approve'
-    ? new Command({ goto: 'tools' })
-    : new Command({ goto: 'agent' });
+  switch (decision) {
+    case 'approve':
+      return new Command({ goto: 'tools' });
+    case 'always':
+      return new Command({
+        goto: 'tools',
+        update: { autoApprove: true },
+      });
+    case 'reject':
+    default:
+      return new Command({ goto: 'agent' });
+  }
 };
